@@ -1,0 +1,11 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["ignore:Using `httpx` with `starlette.testclient` is deprecated"]
+
+[tool.ruff]
+line-length = 160
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B"]
+ignore = ["E501"]

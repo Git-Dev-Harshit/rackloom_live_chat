@@ -1,0 +1,80 @@
+# Rackloom support: tickets from the site's support widget, the Discord ping, the agent's phone check
+# and the live chat. Its own compose project, next to the main stack on the same server
+# (/opt/rackloom/web). It joins that stack's network so Caddy can route /api/support/* here and the
+# web admin page can reach /internal/*; its database is on this project's network only.
+#
+#   cp .env.example .env && chmod 600 .env       # fill in (see README.md)
+#   docker compose build
+#   docker compose --profile tools run --rm migrate
+#   docker compose up -d
+#
+# Nothing is published on the host. Each service receives only the variables it needs.
+name: rackloom-support
+
+services:
+  support-db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: support
+      POSTGRES_PASSWORD: ${SUPPORT_DB_OWNER_PASSWORD:?set SUPPORT_DB_OWNER_PASSWORD in .env}
+      POSTGRES_DB: support
+    volumes:
+      - support_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U support -d support"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  support:
+    image: rackloom-support:local
+    build: .
+    restart: unless-stopped
+    depends_on:
+      support-db:
+        condition: service_healthy
+    environment:
+      # Runtime role: reads and writes rows, cannot change the schema or delete anything.
+      SUPPORT_DATABASE_URL: postgresql://support_app:${SUPPORT_DB_APP_PASSWORD:?set SUPPORT_DB_APP_PASSWORD in .env}@support-db:5432/support
+      SUPPORT_PUBLIC_URL: ${SUPPORT_PUBLIC_URL:-https://rackloom.in}
+      SUPPORT_ALLOWED_ORIGINS: ${SUPPORT_ALLOWED_ORIGINS:-}
+      SUPPORT_INTERNAL_TOKEN: ${SUPPORT_INTERNAL_TOKEN:?set SUPPORT_INTERNAL_TOKEN in .env (same value as in web/.env)}
+      TURNSTILE_SITE_KEY: ${TURNSTILE_SITE_KEY:-}
+      TURNSTILE_SECRET: ${TURNSTILE_SECRET:-}
+      TURNSTILE_ALLOW_TEST_KEYS: ${TURNSTILE_ALLOW_TEST_KEYS:-}
+      SUPPORT_DISCORD_WEBHOOK_URL: ${SUPPORT_DISCORD_WEBHOOK_URL:-}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      MAIL_FROM: ${MAIL_FROM:-Rackloom <support@rackloom.in>}
+      SUPPORT_CONTACT_EMAIL: ${SUPPORT_CONTACT_EMAIL:-support@rackloom.in}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    expose:
+      - "9500"
+    networks:
+      default: {}
+      rackloom:
+        aliases: [support]
+
+  # Applies migrations as the owner and sets the support_app password. Additive only; safe to re-run.
+  migrate:
+    image: rackloom-support:local
+    profiles: ["tools"]
+    depends_on:
+      support-db:
+        condition: service_healthy
+    environment:
+      SUPPORT_MIGRATE_DATABASE_URL: postgresql://support:${SUPPORT_DB_OWNER_PASSWORD:?set SUPPORT_DB_OWNER_PASSWORD in .env}@support-db:5432/support
+      SUPPORT_DB_APP_PASSWORD: ${SUPPORT_DB_APP_PASSWORD:?set SUPPORT_DB_APP_PASSWORD in .env}
+    command: ["python", "-m", "app.cli", "migrate"]
+
+networks:
+  # The main stack's network (compose project "web" in /opt/rackloom/web). Created by that stack.
+  rackloom:
+    external: true
+    name: ${RACKLOOM_NETWORK:-web_default}
+
+volumes:
+  support_pgdata:
