@@ -5,12 +5,12 @@ import asyncio
 import logging
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from functools import partial
 
 import anyio.to_thread
 
-from .config import Settings
+from .config import ESCALATION_COOLDOWN_HOURS, Settings
 from .discord import DiscordWebhook
 from .hub import Conn, Hub
 from .mail import Mailer
@@ -31,6 +31,25 @@ def iso(dt: datetime | None) -> str | None:
     return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z") if dt else None
 
 
+def receipts_for(t: dict, viewer: str) -> dict:
+    """How far the *other* side has got: what the viewer's own messages show as delivered or read."""
+    peer = "agent" if viewer == "customer" else "customer"
+    return {"delivered": t.get(f"{peer}_delivered_seq") or 0, "read": t.get(f"{peer}_read_seq") or 0}
+
+
+def escalation_view(t: dict) -> dict:
+    """Whether the customer may escalate now, and when they may again (once in any 24 hours)."""
+    last = t.get("last_escalated_at")
+    next_at = last + timedelta(hours=ESCALATION_COOLDOWN_HOURS) if last else None
+    cooling = bool(next_at and next_at > datetime.now(timezone.utc))
+    return {
+        "count": t.get("escalation_count") or 0,
+        "last_at": iso(last),
+        "next_at": iso(next_at) if cooling else None,
+        "can_escalate": t["effective_status"] == "CLAIMED" and not cooling,
+    }
+
+
 def customer_ticket_view(t: dict) -> dict:
     status = t["effective_status"]
     return {
@@ -43,6 +62,8 @@ def customer_ticket_view(t: dict) -> dict:
         "access_expires_at": iso(t["access_expires_at"]),
         "can_send": status == "CLAIMED",
         "last_seq": t.get("last_seq", 0),
+        "receipts": receipts_for(t, "customer"),
+        "escalation": escalation_view(t),
     }
 
 
@@ -65,6 +86,8 @@ def agent_ticket_view(t: dict, agent_id: uuid.UUID) -> dict:
             claimed_at=iso(t["claimed_at"]),
             can_send=bool(t.get("agent_active")),
             last_seq=t.get("last_seq", 0),
+            receipts=receipts_for(t, "agent"),
+            escalation={"count": t.get("escalation_count") or 0, "last_at": iso(t.get("last_escalated_at"))},
         )
     return view
 
@@ -100,6 +123,9 @@ class Support:
 
     def portal_url(self, ref: str) -> str:
         return f"{self.settings.public_url}/support/agent/ticket/{ref}"
+
+    def admin_url(self) -> str:
+        return f"{self.settings.public_url}/admin/support"
 
     def return_url(self, ref: str, token: str) -> str:
         # The token rides in the fragment: browsers never send it to a server, a log or a Referer.
@@ -138,3 +164,12 @@ class Support:
                 if m["seq"] > conn.last_seq:
                     await conn.send({"type": "message", "message": message_view(m, conn.role)})
                     conn.last_seq = m["seq"]
+
+    async def publish_receipts(self, ticket_id: uuid.UUID, cursors: dict, *, changed_by: str) -> None:
+        """Tell the other side's sockets how far `changed_by` has got (their sent messages turn to
+        delivered or read). The side that moved already knows."""
+
+        def view(conn: Conn) -> dict | None:
+            return None if conn.role == changed_by else {"type": "receipts", "receipts": receipts_for(cursors, conn.role)}
+
+        await self.hub.publish(ticket_id, view)
