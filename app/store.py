@@ -17,7 +17,7 @@ from datetime import datetime
 import psycopg
 from psycopg_pool import ConnectionPool
 
-from .config import ACCESS_DAYS, CODE_MAX_ATTEMPTS, CODE_TTL_MINUTES
+from .config import ACCESS_DAYS, CODE_MAX_ATTEMPTS, CODE_TTL_MINUTES, ESCALATION_COOLDOWN_HOURS, REPLY_PING_COOLDOWN_MINUTES, REPLY_PING_DELAY_SECONDS
 from .tokens import digest, new_reference
 
 OPEN = ("PENDING", "CLAIMED")
@@ -30,6 +30,8 @@ select t.id, t.public_ticket_reference as reference, t.customer_name, t.customer
        t.status, {EFFECTIVE} as effective_status, t.assigned_agent_id, a.agent_name, a.is_active as agent_active,
        t.created_at, t.updated_at, t.claimed_at, t.resolved_at, t.closed_at, t.last_message_at,
        t.access_expires_at, t.discord_message_id,
+       t.customer_delivered_seq, t.customer_read_seq, t.agent_delivered_seq, t.agent_read_seq,
+       t.last_escalated_at, t.escalation_count,
        (select coalesce(max(m.seq), 0) from support_messages m where m.ticket_id = t.id) as last_seq
 from support_tickets t left join support_agents a on a.id = t.assigned_agent_id
 """
@@ -41,6 +43,10 @@ class DuplicateRequest(Exception):
 
 class AgentExists(Exception):
     pass
+
+
+# Whose progress a read receipt moves. Fixed names, so they can be put into SQL.
+RECEIPT_COLUMNS = {"customer": ("customer_delivered_seq", "customer_read_seq"), "agent": ("agent_delivered_seq", "agent_read_seq")}
 
 
 def first_name(name: str | None) -> str:
@@ -182,6 +188,8 @@ class Store:
             ).fetchone()
             if row:
                 c.execute("update support_tickets set last_message_at = now(), updated_at = now() where id = %s", (ticket_id,))
+                if sender == "CUSTOMER":
+                    self._queue_reply_ping(c, ticket_id)
                 return "ok", self._with_author(c, row, agent_id)
             dup = c.execute(
                 """
@@ -192,6 +200,58 @@ class Store:
                 (ticket_id, sender, client_id),
             ).fetchone()
             return ("duplicate", dup) if dup else ("not_allowed", None)
+
+    @staticmethod
+    def _queue_reply_ping(c, ticket_id: uuid.UUID) -> None:
+        """A "your customer wrote again" post for the assigned agent, due a little later. Whether it is
+        sent is decided then: only if the agent has still not read the message. At most one waits per
+        ticket (a partial unique index), and none is queued within the cooldown after the last one."""
+        c.execute(
+            """
+            insert into support_notifications (ticket_id, kind, next_attempt_at)
+            select %(tid)s, 'discord_customer_reply', now() + make_interval(secs => %(delay)s)
+            where not exists (select 1 from support_notifications where ticket_id = %(tid)s and kind = 'discord_customer_reply'
+                              and status = 'sent' and sent_at > now() - make_interval(mins => %(cool)s))
+            on conflict do nothing
+            """,
+            {"tid": ticket_id, "delay": REPLY_PING_DELAY_SECONDS, "cool": REPLY_PING_COOLDOWN_MINUTES},
+        )
+
+    def record_receipt(self, ticket_id: uuid.UUID, role: str, *, delivered: int, read: int) -> dict | None:
+        """Move one side's delivered/read cursors forwards (never back). Returns all four cursors when
+        something moved, None when nothing did. The caller bounds the values by what it has sent."""
+        d_col, r_col = RECEIPT_COLUMNS[role]
+        delivered = max(delivered, read)
+        with self.pool.connection() as c:
+            return c.execute(
+                f"""
+                update support_tickets set {d_col} = greatest({d_col}, %(d)s), {r_col} = greatest({r_col}, %(r)s)
+                where id = %(id)s and ({d_col} < %(d)s or {r_col} < %(r)s)
+                returning customer_delivered_seq, customer_read_seq, agent_delivered_seq, agent_read_seq
+                """,
+                {"id": ticket_id, "d": delivered, "r": read},
+            ).fetchone()
+
+    def reply_ping_context(self, ticket_id: uuid.UUID) -> dict:
+        """What the customer wrote that the agent has not read: how many messages, the latest one and when.
+
+        Unread is after the agent's read cursor, after their last reply (they answered what came before)
+        and after the claim (claiming shows the conversation so far). The last two also cover tickets
+        claimed before read receipts existed, whose cursor is still 0.
+        """
+        with self.pool.connection() as c:
+            return c.execute(
+                """
+                select count(*) as unread,
+                       (array_agg(m.message_content order by m.seq desc))[1] as latest,
+                       max(m.created_at) as latest_at
+                from support_messages m join support_tickets t on t.id = m.ticket_id
+                where m.ticket_id = %(id)s and m.sender_type = 'CUSTOMER' and m.created_at > t.claimed_at
+                  and m.seq > greatest(t.agent_read_seq,
+                        (select coalesce(max(r.seq), 0) from support_messages r where r.ticket_id = %(id)s and r.sender_type = 'AGENT'))
+                """,
+                {"id": ticket_id},
+            ).fetchone()
 
     @staticmethod
     def _with_author(c, row: dict, agent_id: uuid.UUID | None) -> dict:
@@ -267,6 +327,45 @@ class Store:
             if t["status"] in ("RESOLVED", "CLOSED"):
                 return "ended"
             return "not_yours"
+
+    def escalate(self, ticket_id: uuid.UUID, note: str | None) -> tuple[str, datetime | None]:
+        """The customer escalates their claimed ticket: ("done", None) | ("cooldown", when it is allowed
+        again) | ("not_claimed", None) | ("ended", None).
+
+        Once in any ESCALATION_COOLDOWN_HOURS, enforced by the UPDATE itself, so two clicks (or two
+        tabs) at the same instant escalate once.
+        """
+        with self.pool.connection() as c:
+            row = c.execute(
+                """
+                update support_tickets set last_escalated_at = now(), escalation_count = escalation_count + 1, updated_at = now()
+                where id = %(id)s and status = 'CLAIMED' and now() < access_expires_at
+                  and (last_escalated_at is null or last_escalated_at <= now() - make_interval(hours => %(h)s))
+                returning escalation_count, assigned_agent_id
+                """,
+                {"id": ticket_id, "h": ESCALATION_COOLDOWN_HOURS},
+            ).fetchone()
+            if row:
+                detail = {"count": row["escalation_count"], "note": note or ""}
+                c.execute(
+                    "insert into support_ticket_events (ticket_id, agent_id, action, actor, metadata) values (%s, %s, 'ESCALATED', 'customer', %s)",
+                    (ticket_id, row["assigned_agent_id"], json.dumps(detail)),
+                )
+                text = "This ticket was escalated to the Rackloom Support team for priority attention."
+                self._system(c, ticket_id, f"{text} Reason given: “{note}”" if note else text)
+                c.execute("insert into support_notifications (ticket_id, kind, detail) values (%s, 'discord_escalated', %s)", (ticket_id, json.dumps(detail)))
+                self._notify(c, ticket_id)  # the ticket's own channel post shows the escalation too
+                return "done", None
+            t = c.execute(
+                f"""select t.status, {EFFECTIVE} as effective, t.last_escalated_at + make_interval(hours => %s) as next_at
+                    from support_tickets t where t.id = %s""",
+                (ESCALATION_COOLDOWN_HOURS, ticket_id),
+            ).fetchone()
+            if not t or t["effective"] not in ("PENDING", "CLAIMED"):
+                return "ended", None
+            if t["effective"] == "PENDING":
+                return "not_claimed", None
+            return "cooldown", t["next_at"]
 
     def admin_reassign(self, ref: str, agent_id: uuid.UUID) -> str:
         """An administrator hands a claimed ticket to another active agent: done | not_found | not_claimed | agent_inactive | same."""
@@ -394,7 +493,7 @@ class Store:
                   select id from support_notifications
                   where status = 'pending' and next_attempt_at <= now() and (lease_until is null or lease_until < now())
                   order by next_attempt_at limit %s for update skip locked)
-                returning n.id, n.ticket_id, n.kind, n.attempts
+                returning n.id, n.ticket_id, n.kind, n.attempts, n.detail
                 """,
                 (lease_seconds, limit),
             ).fetchall()
@@ -510,6 +609,7 @@ class Store:
                 f"""
                 select t.public_ticket_reference as reference, {EFFECTIVE} as effective_status, a.agent_name,
                        t.created_at, t.claimed_at, t.resolved_at, t.closed_at, t.last_message_at, t.access_expires_at,
+                       t.last_escalated_at, t.escalation_count,
                        (select count(*) from support_messages m where m.ticket_id = t.id and m.sender_type <> 'SYSTEM') as message_count,
                        n.status as discord_status, n.attempts as discord_attempts, n.last_error as discord_error
                 from support_tickets t

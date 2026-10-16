@@ -3,6 +3,9 @@
 The outbox reads rows committed with the ticket (support_notifications), so nothing is lost if
 Discord, the network or this process is down: a row waits, is retried with growing gaps, and is
 marked failed (and shown on /admin/support) after the last attempt. Retries never touch tickets.
+
+Four kinds: the ticket's own post (created, then edited as it changes), and two kinds of new post
+that are never edited: "your customer replied" for the assigned agent, and an escalation.
 """
 from __future__ import annotations
 
@@ -10,7 +13,7 @@ import asyncio
 import logging
 
 from .core import WS_ENDED, Support
-from .discord import DeliveryError, redact, ticket_payload
+from .discord import DeliveryError, escalation_payload, redact, reply_payload, ticket_payload
 
 log = logging.getLogger("support.outbox")
 
@@ -34,6 +37,9 @@ async def _deliver(sup: Support, n: dict) -> None:
     if not t:
         await sup.db(sup.store.notification_finish, n["id"], status="skipped", error="ticket not found")
         return
+    if n["kind"] in ("discord_customer_reply", "discord_escalated"):
+        await _deliver_post(sup, n, t)
+        return
     payload = ticket_payload(t, sup.portal_url(t["reference"]))
     try:
         if n["kind"] == "discord_created":
@@ -53,15 +59,42 @@ async def _deliver(sup: Support, n: dict) -> None:
         await sup.db(sup.store.notification_sent, n["id"])
         log.info("discord: ticket %s updated (%s)", t["reference"], t["effective_status"])
     except DeliveryError as e:
-        err = redact(str(e), sup.discord.url)
-        attempt = n["attempts"]
-        if e.retryable and attempt <= len(BACKOFF):
-            delay = max(BACKOFF[attempt - 1], e.retry_after or 0)
-            await sup.db(sup.store.notification_retry, n["id"], error=err, delay_seconds=delay)
-            log.warning("discord: ticket %s %s attempt %d failed, retrying in %ss: %s", t["reference"], n["kind"], attempt, delay, err)
-        else:
-            await sup.db(sup.store.notification_finish, n["id"], status="failed", error=err)
-            log.error("discord: ticket %s %s failed for good after %d attempt(s): %s", t["reference"], n["kind"], attempt, err)
+        await _failed(sup, n, t, e)
+
+
+async def _deliver_post(sup: Support, n: dict, t: dict) -> None:
+    """A new channel post about a ticket that is still open. Decided at delivery time, not when it
+    was queued: a reply the agent has read by now, or a ticket that has ended, needs no post."""
+    if t["effective_status"] != "CLAIMED":
+        await sup.db(sup.store.notification_finish, n["id"], status="skipped", error=f"ticket is {t['effective_status'].lower()}")
+        return
+    portal = sup.portal_url(t["reference"])
+    if n["kind"] == "discord_customer_reply":
+        unread = await sup.db(sup.store.reply_ping_context, t["id"])
+        if not unread or not unread["unread"]:
+            await sup.db(sup.store.notification_finish, n["id"], status="skipped", error="the agent has read it")
+            return
+        payload = reply_payload(t, unread, portal)
+    else:
+        payload = escalation_payload(t, n.get("detail") or {}, portal, sup.admin_url(), sup.settings.discord_escalation_mention)
+    try:
+        await sup.discord.create(payload)
+        await sup.db(sup.store.notification_sent, n["id"])
+        log.info("discord: ticket %s %s posted", t["reference"], "reply ping" if n["kind"] == "discord_customer_reply" else "escalation")
+    except DeliveryError as e:
+        await _failed(sup, n, t, e)
+
+
+async def _failed(sup: Support, n: dict, t: dict, e: DeliveryError) -> None:
+    err = redact(str(e), sup.discord.url)
+    attempt = n["attempts"]
+    if e.retryable and attempt <= len(BACKOFF):
+        delay = max(BACKOFF[attempt - 1], e.retry_after or 0)
+        await sup.db(sup.store.notification_retry, n["id"], error=err, delay_seconds=delay)
+        log.warning("discord: ticket %s %s attempt %d failed, retrying in %ss: %s", t["reference"], n["kind"], attempt, delay, err)
+    else:
+        await sup.db(sup.store.notification_finish, n["id"], status="failed", error=err)
+        log.error("discord: ticket %s %s failed for good after %d attempt(s): %s", t["reference"], n["kind"], attempt, err)
 
 
 async def sweep_once(sup: Support) -> None:

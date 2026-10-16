@@ -1,4 +1,4 @@
-"""The customer's side: create a ticket, read it, and reopen it from the return link."""
+"""The customer's side: create a ticket, read it, reopen it from the return link, and escalate it."""
 from __future__ import annotations
 
 import json
@@ -11,14 +11,14 @@ from fastapi import APIRouter, Depends, Query, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from .config import ACCESS_DAYS, CODE_TTL_MINUTES, EMAIL_MAX, MESSAGE_MAX, NAME_MAX, QUERY_MAX
-from .core import Support, customer_ticket_view, message_view
+from .config import ACCESS_DAYS, CODE_TTL_MINUTES, EMAIL_MAX, ESCALATION_COOLDOWN_HOURS, ESCALATION_NOTE_MAX, MESSAGE_MAX, NAME_MAX, QUERY_MAX
+from .core import Support, customer_ticket_view, iso, message_view
 from .http import CUSTOMER_COOKIE, ApiError, browser_post_guard, client_ip, customer_cookie_path, set_session_cookie
 from .mail import MailError, code_mail, link_mail
 from .store import OPEN, DuplicateRequest
 from .tokens import digest, new_code, new_token, normalize_reference
 from .turnstile import CaptchaError, CaptchaMissing, CaptchaUnavailable
-from .validation import InvalidInput, clean_text, mask_email, normalize_email, normalize_phone
+from .validation import InvalidInput, clean_name, clean_text, mask_email, normalize_email, normalize_phone
 
 log = logging.getLogger("support.customer")
 
@@ -35,6 +35,11 @@ class TicketIn(BaseModel):
     phone: str | None = Field(default=None, max_length=100)
     phone_country: str | None = Field(default=None, max_length=2)
     message: str = Field(default="", max_length=20000)
+
+
+class EscalateIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    note: str | None = Field(default=None, max_length=4000)
 
 
 class SessionIn(BaseModel):
@@ -73,7 +78,8 @@ def router(support_of, settings) -> APIRouter:
             "captcha": sup.turnstile.enabled,
             "access_days": ACCESS_DAYS,
             "support_email": sup.settings.support_email,
-            "limits": {"name": NAME_MAX, "email": EMAIL_MAX, "query": QUERY_MAX, "message": MESSAGE_MAX},
+            "limits": {"name": NAME_MAX, "email": EMAIL_MAX, "query": QUERY_MAX, "message": MESSAGE_MAX, "escalation_note": ESCALATION_NOTE_MAX},
+            "escalation_cooldown_hours": ESCALATION_COOLDOWN_HOURS,
         }
 
     @r.post("/tickets", status_code=201, dependencies=[post_guard])
@@ -87,7 +93,7 @@ def router(support_of, settings) -> APIRouter:
         fields: dict[str, str] = {}
         name = email = phone = message = None
         try:
-            name = clean_text(body.name, max_len=NAME_MAX, multiline=False)
+            name = clean_name(body.name, max_len=NAME_MAX)
         except InvalidInput as e:
             fields["name"] = str(e) if body.name.strip() else "Tell us your name."
         if body.email and body.email.strip():
@@ -173,6 +179,36 @@ def router(support_of, settings) -> APIRouter:
         _, t = await customer_session(sup, request, ref, require_open=True)
         rows, more = await sup.db(sup.store.messages, t["id"], after=after, limit=limit_)
         return {"messages": [message_view(m, "customer") for m in rows], "has_more": more}
+
+    @r.post("/tickets/{ref}/escalate", dependencies=[post_guard])
+    async def escalate(ref: str, body: EscalateIn, request: Request):
+        """The customer says the agent has not solved it: the team is alerted in Discord, at most
+        once in any 24 hours per ticket, and only while an agent holds the ticket."""
+        sup: Support = support_of(request)
+        limit(sup, f"escalate:{client_ip(request)}", 10, 3600)
+        _, t = await customer_session(sup, request, ref, require_open=True)
+        note = None
+        if body.note and body.note.strip():
+            try:
+                note = clean_text(body.note, max_len=ESCALATION_NOTE_MAX)
+            except InvalidInput as e:
+                raise ApiError(422, "invalid_request", "Please check the highlighted fields.", fields={"note": str(e)}) from None
+        outcome, next_at = await sup.db(sup.store.escalate, t["id"], note)
+        if outcome == "done":
+            log.info("ticket %s escalated by the customer", t["reference"])
+            await sup.ticket_changed(t["id"])
+            fresh = await sup.db(sup.store.ticket, t["id"])
+            return {"ticket": customer_ticket_view(fresh)}
+        if outcome == "cooldown":
+            raise ApiError(
+                429, "escalation_cooldown",
+                f"You escalated this ticket recently. You can escalate it again {ESCALATION_COOLDOWN_HOURS} hours after the last time.",
+                next_at=iso(next_at),
+            )
+        if outcome == "not_claimed":
+            raise ApiError(409, "not_claimed", "You can escalate once an agent has picked up your ticket.")
+        fresh = await sup.db(sup.store.ticket, t["id"])
+        raise ApiError(410, "ticket_closed", "This conversation has ended.", status=fresh["effective_status"] if fresh else None)
 
     @r.post("/tickets/{ref}/session", dependencies=[post_guard])
     async def open_session(ref: str, body: SessionIn, request: Request, response: Response):

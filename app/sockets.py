@@ -2,7 +2,12 @@
 connect, again in SQL on every message, and again by the periodic sweep for sockets left open.
 
 Client -> server:  {"type": "message", "client_id": "<uuid>", "body": "..."}  |  {"type": "ping"}
+                   {"type": "typing", "typing": true|false}
+                   {"type": "receipt", "delivered": <seq>, "read": <seq>}   (how far this side has got)
 Server -> client:  ready (ticket) | message | ack (client_id, message) | ticket | error | pong
+                   typing (sender, typing) | receipts (the other side's delivered/read seq)
+Typing and receipts are best-effort extras: never stored as messages, rate-limited, and silently
+dropped when over the limit, so a chatty client can slow neither the chat nor the database.
 Close codes 44xx mean "do not reconnect": 4401 no session, 4403 not yours, 4410 ended, 4429 too many.
 """
 from __future__ import annotations
@@ -116,8 +121,45 @@ async def _receive(sup: Support, conn: Conn) -> None:
         elif kind == "message":
             if await _message(sup, conn, data) is False:
                 return
+        elif kind == "typing":
+            await _typing(sup, conn, data)
+        elif kind == "receipt":
+            await _receipt(sup, conn, data)
         else:
             await conn.send({"type": "error", "code": "unknown_type", "message": "Unknown message type."})
+
+
+async def _typing(sup: Support, conn: Conn, data: dict) -> None:
+    """Relay "is typing" to the other side's sockets only. Nothing is stored. A client sends it every
+    few seconds while someone types; more than that is dropped."""
+    ok, _ = sup.limiter.hit(f"typing:{conn.session_id}", 20, 20)
+    if not ok:
+        return
+    event = {"type": "typing", "sender": conn.role, "typing": data.get("typing") is True}
+    await sup.hub.publish(conn.ticket_id, lambda other: event if other.role != conn.role else None)
+
+
+def _seq(v) -> int | None:
+    return v if isinstance(v, int) and not isinstance(v, bool) and v >= 0 else None
+
+
+async def _receipt(sup: Support, conn: Conn, data: dict) -> None:
+    """This side has received (delivered) and seen (read) the conversation up to a seq. A client can
+    only vouch for what this socket was actually sent, so both are capped at conn.last_seq."""
+    delivered, read = _seq(data.get("delivered")), _seq(data.get("read"))
+    if delivered is None and read is None:
+        return
+    read = min(read or 0, conn.last_seq)
+    delivered = max(min(delivered or 0, conn.last_seq), read)
+    if delivered <= conn.receipt[0] and read <= conn.receipt[1]:
+        return
+    ok, _ = sup.limiter.hit(f"receipt:{conn.session_id}", 60, 30)
+    if not ok:
+        return
+    conn.receipt = (max(delivered, conn.receipt[0]), max(read, conn.receipt[1]))
+    cursors = await sup.db(sup.store.record_receipt, conn.ticket_id, conn.role, delivered=delivered, read=read)
+    if cursors:
+        await sup.publish_receipts(conn.ticket_id, cursors, changed_by=conn.role)
 
 
 async def _message(sup: Support, conn: Conn, data: dict) -> bool | None:

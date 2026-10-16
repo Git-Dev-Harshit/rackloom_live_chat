@@ -24,6 +24,13 @@ EMAIL_MAX = 254
 QUERY_MAX = 4000
 MESSAGE_MAX = 2000
 BODY_LIMIT_BYTES = 16 * 1024
+# A customer may escalate an open ticket once in any 24 hours, with an optional note.
+ESCALATION_COOLDOWN_HOURS = 24
+ESCALATION_NOTE_MAX = 500
+# "Your customer wrote again" in Discord: sent only if the agent has not read the message this long
+# after it arrived, and at most once per ticket in this many minutes.
+REPLY_PING_DELAY_SECONDS = 90
+REPLY_PING_COOLDOWN_MINUTES = 15
 
 
 @dataclass(frozen=True)
@@ -44,6 +51,8 @@ class Settings:
     turnstile_allow_test_keys: bool = field(default_factory=lambda: _env("TURNSTILE_ALLOW_TEST_KEYS") == "1")
     # Incoming webhook of the private support channel. Empty: tickets queue until it is set.
     discord_webhook_url: str = field(default_factory=lambda: _env("SUPPORT_DISCORD_WEBHOOK_URL"))
+    # Who an escalation pings: @here, @everyone, <@&role id> or <@user id>. Empty: nobody (the post still goes).
+    discord_escalation_mention: str = field(default_factory=lambda: _env("SUPPORT_DISCORD_ESCALATION_MENTION"))
     # Mail for the return link and the new-browser code. Same variables as web and auth.
     smtp_host: str = field(default_factory=lambda: _env("SMTP_HOST"))
     smtp_port: int = field(default_factory=lambda: int(_env("SMTP_PORT", "587") or "587"))
@@ -90,4 +99,8 @@ class Settings:
                 out.append("TURNSTILE_SECRET is a Cloudflare test secret, which passes any token: set the site's real secret")
             if not self.turnstile_site_key:
                 out.append("TURNSTILE_SITE_KEY is not set: the widget could not show the captcha")
+        from .discord import valid_mention
+
+        if self.discord_escalation_mention and not valid_mention(self.discord_escalation_mention):
+            out.append("SUPPORT_DISCORD_ESCALATION_MENTION must be @here, @everyone, <@&role id> or <@user id>")
         return out

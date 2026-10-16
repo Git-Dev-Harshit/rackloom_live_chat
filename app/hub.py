@@ -25,6 +25,8 @@ class Conn:
     agent_id: uuid.UUID | None = None
     # The newest message this socket has been sent; pushes resume after it.
     last_seq: int = 0
+    # The read receipt this socket last reported (delivered, read), so a repeat costs no query.
+    receipt: tuple[int, int] = (0, 0)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     async def send(self, event: dict) -> bool:

@@ -24,7 +24,7 @@ from .config import NAME_MAX, Settings
 from .db import migrate, open_pool
 from .store import AgentExists, Store
 from .tokens import normalize_reference
-from .validation import InvalidInput, clean_text, normalize_phone
+from .validation import InvalidInput, clean_name, normalize_phone
 
 
 def _store(s: Settings) -> Store:
@@ -107,7 +107,7 @@ def main(argv: list[str] | None = None) -> int:
                 _print_agents(st.list_agents())
             elif args.action == "add":
                 try:
-                    name = clean_text(args.name, max_len=NAME_MAX, multiline=False)
+                    name = clean_name(args.name, max_len=NAME_MAX)
                     e164 = normalize_phone(args.phone, args.country)
                     _print_agents([st.create_agent(name, e164)])
                 except InvalidInput as e:
@@ -117,7 +117,7 @@ def main(argv: list[str] | None = None) -> int:
             elif args.action == "update":
                 a = _agent(st, args.agent, args.country)
                 try:
-                    name = clean_text(args.name, max_len=NAME_MAX, multiline=False) if args.name else None
+                    name = clean_name(args.name, max_len=NAME_MAX) if args.name else None
                     e164 = normalize_phone(args.phone, args.country) if args.phone else None
                     _print_agents([st.update_agent(a["id"], name=name, e164=e164)])
                 except InvalidInput as e:
