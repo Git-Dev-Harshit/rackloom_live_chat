@@ -29,7 +29,7 @@ ESCALATION_COOLDOWN_HOURS = 24
 ESCALATION_NOTE_MAX = 500
 # "Your customer wrote again" in Discord: sent only if the agent has not read the message this long
 # after it arrived, and at most once per ticket in this many minutes.
-REPLY_PING_DELAY_SECONDS = 90
+REPLY_PING_DELAY_SECONDS = 60
 REPLY_PING_COOLDOWN_MINUTES = 15
 
 
